@@ -1,127 +1,314 @@
 import os
+import sys
+import logging
 from datetime import datetime
+from pathlib import Path
+from typing import Optional, List
 
 import cloudscraper
 from xhtml2pdf import pisa
-from PyPDF2 import PdfMerger, PdfReader
 from bs4 import BeautifulSoup as bs
-import sys
 from tqdm import tqdm
+
+# Fix for pypdf imports - handle both old and new versions
+try:
+    from pypdf import PdfMerger, PdfReader
+except ImportError:
+    try:
+        from pypdf import PdfWriter as PdfMerger, PdfReader
+    except ImportError:
+        # Fallback to PyPDF2 if pypdf not available
+        from PyPDF2 import PdfMerger, PdfReader
 
 from utils.sanCleaner import Cleaner
 from utils.sanUrls import Urls
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('sanfoundry.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-def check_dir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+
+class Config:
+    """Configuration constants"""
+    SF_PATH = Path("SanfoundryFiles")
+    MERGED_PATH = Path("Merged_Pdfs")
+    PDF_ENCODING = 'utf-8'
+    MAX_RETRIES = 3
+    REQUEST_TIMEOUT = 30
+
+
+def check_dir(path: Path) -> None:
+    """Create directory if it doesn't exist"""
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def confirm_prompt(question: str) -> bool:
-    reply = None
-    while reply not in ("", "y", "n"):
-        reply = input(f"{question} (Y/n): ").lower()
-    return reply in ("", "y")
+    """Prompt user for yes/no confirmation"""
+    while True:
+        reply = input(f"{question} (Y/n): ").lower().strip()
+        if reply in ("", "y", "yes"):
+            return True
+        elif reply in ("n", "no"):
+            return False
+        print("Please enter 'y' or 'n'")
 
 
-def convert_html_to_pdf(source_html, output_filename):
-    # open output file for writing (truncated binary)
-    result_file = open(output_filename, "w+b")
+def convert_html_to_pdf(source_html: str, output_filename: Path) -> bool:
+    """
+    Convert HTML to PDF using xhtml2pdf
 
-    # convert HTML to PDF
-    pisa_status = pisa.CreatePDF(
-        source_html,  # the HTML to convert
-        dest=result_file)  # file handle to recieve result
+    Args:
+        source_html: HTML content as string
+        output_filename: Path to output PDF file
 
-    # close output file
-    result_file.close()  # close output file
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        with open(output_filename, "w+b") as result_file:
+            pisa_status = pisa.CreatePDF(source_html, dest=result_file)
 
-    # return False on success and True on errors
-    return pisa_status.err
+        if pisa_status.err:
+            logger.error(f"PDF conversion failed for {output_filename}")
+            return False
+
+        logger.info(f"Successfully created PDF: {output_filename}")
+        return True
+    except Exception as e:
+        logger.error(f"Error creating PDF {output_filename}: {e}")
+        return False
 
 
-class Sanfoundry(object):
+class Sanfoundry:
+    """Main class for scraping and processing Sanfoundry MCQs"""
 
     def __init__(self):
-        self.mode = int(input(
-            "\nEnter 0 to download 'Single MCQ Page' "
-            "\nEnter 1 to download 'MCQ Sets' "
-            "\nEnter 2 to merge existing pdfs"
-            "\n\nEnter Input (0 - 2): "
-        ))
+        self.mode = self._get_mode()
         self.pdf_options = {
-            'encoding': 'utf-8',
+            'encoding': Config.PDF_ENCODING,
             'enable-local-file-access': '',
         }
-        self.sf_path = "SanfoundryFiles/"
-        self.merged_path = "Merged Pdfs/"
+        self.scraper = cloudscraper.CloudScraper()
 
+        check_dir(Config.SF_PATH)
+        check_dir(Config.MERGED_PATH)
+
+        try:
+            self._execute_mode()
+        except KeyboardInterrupt:
+            logger.info("\nOperation cancelled by user")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Fatal error: {e}", exc_info=True)
+            sys.exit(1)
+
+    @staticmethod
+    def _get_mode() -> int:
+        """Get operation mode from user"""
+        while True:
+            try:
+                print("\n" + "=" * 50)
+                print("SANFOUNDRY MCQ SCRAPER")
+                print("=" * 50)
+                print("\n0 - Download Single MCQ Page")
+                print("1 - Download Multiple MCQ Sets")
+                print("2 - Merge Existing PDFs")
+                print("\n" + "=" * 50)
+
+                mode = int(input("\nEnter mode (0-2): ").strip())
+                if mode in (0, 1, 2):
+                    return mode
+                print("Invalid mode. Please enter 0, 1, or 2.")
+            except ValueError:
+                print("Invalid input. Please enter a number.")
+
+    def _execute_mode(self) -> None:
+        """Execute the selected mode"""
         if self.mode == 1:
-            self.auto()
-            self.merge_all_pdf()
+            self.auto_scrape()
+            self.merge_all_pdfs()
         elif self.mode == 2:
-            self.merge_all_pdf()
+            self.merge_all_pdfs()
         else:
-            self.url = input("\nEnter Sanfoundry MCQ URL: ")
-            self.scrape()
+            self.single_scrape()
 
-    def auto(self):
-        url_list = Urls().getUrls()
+    def auto_scrape(self) -> None:
+        """Automatically scrape multiple MCQ pages"""
+        try:
+            url_fetcher = Urls()
+            url_list = url_fetcher.get_urls()
 
-        for url in tqdm(url_list, desc="Saving MCQs"):
-            self.url = url
-            self.scrape()
+            if not url_list:
+                logger.warning("No URLs found to scrape")
+                return
 
-    def scrape(self):
-        with cloudscraper.CloudScraper() as s:
-            r = s.get(self.url)
-            soup = bs(r.content, "html5lib")
-            html, mathjax = Cleaner().clean(soup)
-            filename = self.url.split("/")[3]
-            check_dir(self.sf_path)
+            logger.info(f"Found {len(url_list)} URLs to scrape")
+            successful = 0
+            failed = 0
 
-            if mathjax:
-                self.pdf_options['window-status'] = 'Rendered'
-
-            convert_html_to_pdf(html, f"{self.sf_path}{filename}.pdf")
-
-            if self.mode == 0:
-                more = confirm_prompt("Scrape More?")
-                if more:
-                    self.url = input("\nEnter Sanfoundry MCQ URL: ")
-                    self.scrape()
+            for url in tqdm(url_list, desc="Scraping MCQs"):
+                if self.scrape(url):
+                    successful += 1
                 else:
-                    sys.exit()
+                    failed += 1
 
-    def merge_all_pdf(self):
-        pdf_files = os.listdir(self.sf_path)
+            logger.info(f"Scraping complete. Success: {successful}, Failed: {failed}")
 
-        if not pdf_files:
-            print("\nNo PDF Files Found.")
-            sys.exit()
+        except Exception as e:
+            logger.error(f"Error in auto scrape: {e}", exc_info=True)
 
-        delete = confirm_prompt("Delete pdfs after merging?")
-        merger = PdfMerger()
+    def single_scrape(self) -> None:
+        """Scrape single MCQ page with option to continue"""
+        while True:
+            url = input("\nEnter Sanfoundry MCQ URL: ").strip()
 
+            if not url:
+                print("URL cannot be empty")
+                continue
+
+            self.scrape(url)
+
+            if not confirm_prompt("\nScrape another page?"):
+                break
+
+    def scrape(self, url: str) -> bool:
+        """
+        Scrape a single MCQ page
+
+        Args:
+            url: URL to scrape
+
+        Returns:
+            True if successful, False otherwise
+        """
+        for attempt in range(Config.MAX_RETRIES):
+            try:
+                logger.info(f"Scraping: {url} (attempt {attempt + 1}/{Config.MAX_RETRIES})")
+
+                # Fetch page content
+                response = self.scraper.get(url, timeout=Config.REQUEST_TIMEOUT)
+                response.raise_for_status()
+
+                # Parse and clean HTML
+                soup = bs(response.content, "lxml")
+                html, has_mathjax = Cleaner().clean(soup)
+
+                # Generate filename from URL
+                filename = self._generate_filename(url)
+                output_path = Config.SF_PATH / f"{filename}.pdf"
+
+                # Set MathJax option if needed
+                if has_mathjax:
+                    self.pdf_options['window-status'] = 'Rendered'
+
+                # Convert to PDF
+                return convert_html_to_pdf(html, output_path)
+
+            except Exception as e:
+                logger.error(f"Error scraping {url} (attempt {attempt + 1}): {e}")
+                if attempt == Config.MAX_RETRIES - 1:
+                    logger.error(f"Failed to scrape {url} after {Config.MAX_RETRIES} attempts")
+                    return False
+
+        return False
+
+    @staticmethod
+    def _generate_filename(url: str) -> str:
+        """Generate safe filename from URL"""
+        try:
+            # Extract meaningful part from URL
+            filename = url.split("/")[3] if len(url.split("/")) > 3 else "mcq"
+            # Remove special characters
+            filename = "".join(c for c in filename if c.isalnum() or c in ('-', '_'))
+            return filename or "mcq"
+        except Exception:
+            return f"mcq_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def merge_all_pdfs(self) -> None:
+        """Merge all PDF files in the SF_PATH directory"""
+        try:
+            pdf_files = list(Config.SF_PATH.glob("*.pdf"))
+
+            if not pdf_files:
+                logger.warning("No PDF files found to merge")
+                print("\nNo PDF files found in the output directory.")
+                return
+
+            logger.info(f"Found {len(pdf_files)} PDF files to merge")
+            print(f"\nFound {len(pdf_files)} PDF files")
+
+            delete_after = confirm_prompt("Delete individual PDFs after merging?")
+
+            # Handle both PdfMerger and PdfWriter APIs
+            merger = PdfMerger()
+            failed_files = []
+
+            for pdf_file in tqdm(pdf_files, desc="Merging PDFs"):
+                try:
+                    # Try new pypdf API first
+                    if hasattr(merger, 'append'):
+                        merger.append(str(pdf_file))
+                    else:
+                        # Fallback to old API
+                        with open(pdf_file, "rb") as pdf:
+                            merger.append(PdfReader(pdf))
+                except Exception as e:
+                    logger.error(f"Error merging {pdf_file}: {e}")
+                    failed_files.append(pdf_file.name)
+
+            if failed_files:
+                logger.warning(f"Failed to merge {len(failed_files)} files: {failed_files}")
+
+            # Save merged PDF
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = Config.MERGED_PATH / f"Sanfoundry_Merged_{timestamp}.pdf"
+
+            with open(output_path, "wb") as fout:
+                merger.write(fout)
+
+            # Close merger if method exists
+            if hasattr(merger, 'close'):
+                merger.close()
+
+            logger.info(f"Merged PDF saved to: {output_path}")
+            print(f"\n✓ Merged PDF saved to: {output_path}")
+
+            if delete_after:
+                self._delete_all_pdfs(pdf_files)
+
+        except Exception as e:
+            logger.error(f"Error merging PDFs: {e}", exc_info=True)
+
+    @staticmethod
+    def _delete_all_pdfs(pdf_files: List[Path]) -> None:
+        """Delete specified PDF files"""
+        deleted = 0
         for pdf_file in pdf_files:
-            with open(self.sf_path + pdf_file, "rb") as pdf:
-                merger.append(PdfReader(pdf), import_outline=False)
-                pdf.close()
+            try:
+                pdf_file.unlink()
+                deleted += 1
+            except Exception as e:
+                logger.error(f"Error deleting {pdf_file}: {e}")
 
-        check_dir(self.merged_path)
-        current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
-        with open(f"{self.merged_path}Sanfoundry_Merged_{current_time}.pdf", "wb") as fout:
-            merger.write(fout)
+        logger.info(f"Deleted {deleted}/{len(pdf_files)} PDF files")
+        print(f"Deleted {deleted} individual PDF files")
 
-        if delete:
-            self.delete_all_pdf()
 
-    def delete_all_pdf(self):
-        files_to_delete = os.listdir(self.sf_path)
-
-        for file_name in files_to_delete:
-            os.remove(os.path.join(self.sf_path, file_name))
+def main():
+    """Main entry point"""
+    try:
+        Sanfoundry()
+    except Exception as e:
+        logger.critical(f"Application crashed: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
-    Sanfoundry()
+    main()
