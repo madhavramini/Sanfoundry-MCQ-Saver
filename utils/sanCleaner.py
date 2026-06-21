@@ -183,12 +183,13 @@ class Cleaner:
         """Check if text should be removed based on patterns"""
         return text and any(text.strip().startswith(pattern) for pattern in self.text_patterns_to_remove)
 
-    def clean(self, soup: bs) -> Tuple[str, bool]:
+    def clean(self, soup: bs, page=None) -> Tuple[str, bool]:
         """
         Clean HTML content for PDF conversion
 
         Args:
             soup: BeautifulSoup object of the page
+            page: Optional browser page instance for in-browser image fetching
 
         Returns:
             Tuple of (cleaned HTML string, has_mathjax flag)
@@ -210,7 +211,7 @@ class Cleaner:
             content.attrs = {}
 
             # Process images
-            self._process_images(content)
+            self._process_images(content, page)
 
             # Remove unwanted elements
             self._remove_unwanted_elements(content)
@@ -227,7 +228,7 @@ class Cleaner:
             logger.error(f"Error cleaning content: {e}", exc_info=True)
             raise
 
-    def _process_images(self, content: bs) -> None:
+    def _process_images(self, content: bs, page=None) -> None:
         """Process and embed images as base64"""
         images = content.find_all('img')
 
@@ -256,27 +257,57 @@ class Cleaner:
             if img_src and img_src.startswith('http'):
                 image_tasks.append((img, img_src))
 
-        # Fetch images in parallel
-        with ThreadPoolExecutor(max_workers=Config.MAX_IMAGE_WORKERS) as executor:
-            future_to_img = {
-                executor.submit(fetch_image_base64, url): (img, url)
-                for img, url in image_tasks
-            }
-
-            for future in as_completed(future_to_img):
-                img, url = future_to_img[future]
+        if page:
+            # Fetch images inside the browser to bypass Cloudflare
+            js_code = """
+            return (async () => {
+                try {
+                    const response = await fetch(arguments[0]);
+                    const blob = await response.blob();
+                    return new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result);
+                        reader.onerror = reject;
+                        reader.readAsDataURL(blob);
+                    });
+                } catch (e) {
+                    return null;
+                }
+            })()
+            """
+            for img, url in image_tasks:
                 try:
-                    base64_data = future.result()
-                    if base64_data:
+                    base64_data = page.run_js(js_code, url)
+                    if base64_data and base64_data.startswith('data:image'):
                         img['src'] = base64_data
-                        # Remove other attributes
                         img.attrs = {'src': img['src']}
                     else:
-                        # Remove failed images
                         img.decompose()
                 except Exception as e:
-                    logger.error(f"Error processing image {url}: {e}")
+                    logger.error(f"Error processing image {url} via browser JS: {e}")
                     img.decompose()
+        else:
+            # Fetch images in parallel
+            with ThreadPoolExecutor(max_workers=Config.MAX_IMAGE_WORKERS) as executor:
+                future_to_img = {
+                    executor.submit(fetch_image_base64, url): (img, url)
+                    for img, url in image_tasks
+                }
+
+                for future in as_completed(future_to_img):
+                    img, url = future_to_img[future]
+                    try:
+                        base64_data = future.result()
+                        if base64_data:
+                            img['src'] = base64_data
+                            # Remove other attributes
+                            img.attrs = {'src': img['src']}
+                        else:
+                            # Remove failed images
+                            img.decompose()
+                    except Exception as e:
+                        logger.error(f"Error processing image {url}: {e}")
+                        img.decompose()
 
     def _remove_unwanted_elements(self, content: bs) -> None:
         """Remove unwanted HTML elements"""

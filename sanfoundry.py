@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 
-import cloudscraper
 from xhtml2pdf import pisa
 from bs4 import BeautifulSoup as bs
 from tqdm import tqdm
@@ -95,7 +94,7 @@ class Sanfoundry:
             'encoding': Config.PDF_ENCODING,
             'enable-local-file-access': '',
         }
-        self.scraper = cloudscraper.CloudScraper()
+        self._page = None
 
         check_dir(Config.SF_PATH)
         check_dir(Config.MERGED_PATH)
@@ -108,6 +107,21 @@ class Sanfoundry:
         except Exception as e:
             logger.error(f"Fatal error: {e}", exc_info=True)
             sys.exit(1)
+        finally:
+            if self._page is not None:
+                try:
+                    self._page.quit()
+                except Exception:
+                    pass
+
+    def _get_browser_page(self):
+        """Lazily initialize browser page instance"""
+        if self._page is None:
+            from DrissionPage import ChromiumPage, ChromiumOptions
+            co = ChromiumOptions().set_local_port(9333)
+            co.no_imgs(True)
+            self._page = ChromiumPage(co)
+        return self._page
 
     @staticmethod
     def _get_mode() -> int:
@@ -121,6 +135,7 @@ class Sanfoundry:
                 print("1 - Download Multiple MCQ Sets")
                 print("2 - Merge Existing PDFs")
                 print("\n" + "=" * 50)
+ 
 
                 mode = int(input("\nEnter mode (0-2): ").strip())
                 if mode in (0, 1, 2):
@@ -142,7 +157,8 @@ class Sanfoundry:
     def auto_scrape(self) -> None:
         """Automatically scrape multiple MCQ pages"""
         try:
-            url_fetcher = Urls()
+            page = self._get_browser_page()
+            url_fetcher = Urls(page=page)
             url_list = url_fetcher.get_urls()
 
             if not url_list:
@@ -192,13 +208,22 @@ class Sanfoundry:
             try:
                 logger.info(f"Scraping: {url} (attempt {attempt + 1}/{Config.MAX_RETRIES})")
 
-                # Fetch page content
-                response = self.scraper.get(url, timeout=Config.REQUEST_TIMEOUT)
-                response.raise_for_status()
+                # Fetch page content using DrissionPage
+                page = self._get_browser_page()
+                page.get(url)
+
+                # Wait for Cloudflare bypass if needed
+                import time
+                for _ in range(10):
+                    if "Just a moment" not in page.title:
+                        break
+                    time.sleep(1)
+
+                html_content = page.html
 
                 # Parse and clean HTML
-                soup = bs(response.content, "lxml")
-                html, has_mathjax = Cleaner().clean(soup)
+                soup = bs(html_content, "lxml")
+                html, has_mathjax = Cleaner().clean(soup, page)
 
                 # Generate filename from URL
                 filename = self._generate_filename(url)
@@ -278,7 +303,7 @@ class Sanfoundry:
                 merger.close()
 
             logger.info(f"Merged PDF saved to: {output_path}")
-            print(f"\n✓ Merged PDF saved to: {output_path}")
+            print(f"\n[SUCCESS] Merged PDF saved to: {output_path}")
 
             if delete_after:
                 self._delete_all_pdfs(pdf_files)
