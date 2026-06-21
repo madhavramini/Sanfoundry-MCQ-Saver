@@ -10,6 +10,7 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 
+
 class Config:
     """Configuration constants"""
     REQUEST_TIMEOUT = 30

@@ -22,13 +22,27 @@ except ImportError:
 from utils.sanCleaner import Cleaner
 from utils.sanUrls import Urls
 
+class _TqdmLoggingHandler(logging.StreamHandler):
+    """Logging handler that writes via tqdm.write() to avoid breaking progress bars."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 # Configure logging
+# Console output is routed through tqdm.write() so the progress bar stays
+# in-place when log messages arrive. The file handler is unaffected.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('sanfoundry.log'),
-        logging.StreamHandler()
+        _TqdmLoggingHandler(),
     ]
 )
 logger = logging.getLogger(__name__)
